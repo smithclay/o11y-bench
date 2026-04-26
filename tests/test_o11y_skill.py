@@ -1,0 +1,169 @@
+"""Tests for the o11y skill bundle (instructions + helpers).
+
+The helpers are async closures over an MCP session and an internal datasource
+uid cache. We exercise them with a duck-typed mock session so we can assert
+the wire-tool dispatch and uid caching without standing up the real Grafana
+sidecar.
+"""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from agents.o11y_skill import build_o11y_skill, build_tools
+
+
+class MockMCPSession:
+    """Records call_tool invocations and returns canned JSON-encoded results."""
+
+    def __init__(self, canned: dict[str, Any] | None = None) -> None:
+        self.canned = canned or {}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        self.calls.append((name, dict(arguments)))
+        payload = self.canned.get(name, {"ok": True, "name": name, "args": arguments})
+        return SimpleNamespace(content=[SimpleNamespace(text=json.dumps(payload))])
+
+
+_DATASOURCES = [
+    {"uid": "prom-1", "name": "Prometheus", "type": "prometheus"},
+    {"uid": "loki-1", "name": "Loki", "type": "loki"},
+    {"uid": "tempo-1", "name": "Tempo", "type": "tempo"},
+]
+
+
+def test_build_tools_keys_match_expected_helpers():
+    tools = build_tools(MockMCPSession())
+    assert set(tools) == {
+        "list_datasources",
+        "query_metrics",
+        "query_logs",
+        "query_traces",
+        "get_dashboard",
+        "save_dashboard",
+        "search_dashboards",
+    }
+
+
+@pytest.mark.anyio
+async def test_query_metrics_routes_to_query_prometheus_with_resolved_uid():
+    session = MockMCPSession(
+        canned={
+            "list_datasources": _DATASOURCES,
+            "query_prometheus": {"data": {"result": [{"value": [0, "1"]}]}},
+        }
+    )
+    tools = build_tools(session)
+
+    result = await tools["query_metrics"](
+        expr="up", start="2026-04-25T00:00:00Z", end="2026-04-25T01:00:00Z", step="5m"
+    )
+
+    # First call resolves the uid; second is the actual query.
+    assert session.calls[0] == ("list_datasources", {})
+    assert session.calls[1] == (
+        "query_prometheus",
+        {
+            "datasourceUid": "prom-1",
+            "expr": "up",
+            "startTime": "2026-04-25T00:00:00Z",
+            "endTime": "2026-04-25T01:00:00Z",
+            "queryType": "range",
+            "stepSeconds": 300,
+        },
+    )
+    assert result == {"data": {"result": [{"value": [0, "1"]}]}}
+
+
+@pytest.mark.anyio
+async def test_uid_cache_is_populated_once_across_helpers():
+    session = MockMCPSession(canned={"list_datasources": _DATASOURCES})
+    tools = build_tools(session)
+
+    await tools["query_metrics"](expr="up")
+    await tools["query_logs"](
+        expr='{job="x"}', start="2026-04-25T00:00:00Z", end="2026-04-25T01:00:00Z"
+    )
+    await tools["query_traces"](traceql="{}")
+
+    # Exactly one list_datasources call across three helper invocations.
+    list_calls = [c for c in session.calls if c[0] == "list_datasources"]
+    assert len(list_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_query_logs_uses_loki_wire_name_and_kwargs():
+    session = MockMCPSession(canned={"list_datasources": _DATASOURCES})
+    tools = build_tools(session)
+
+    await tools["query_logs"](
+        expr='{job="x"}',
+        start="2026-04-25T00:00:00Z",
+        end="2026-04-25T01:00:00Z",
+        limit=50,
+    )
+
+    loki_call = next(c for c in session.calls if c[0] == "query_loki_logs")
+    assert loki_call[1] == {
+        "datasourceUid": "loki-1",
+        "logql": '{job="x"}',
+        "startRfc3339": "2026-04-25T00:00:00Z",
+        "endRfc3339": "2026-04-25T01:00:00Z",
+        "limit": 50,
+        "direction": "backward",
+    }
+
+
+@pytest.mark.anyio
+async def test_query_traces_uses_tempo_traceql_search_wire_name():
+    session = MockMCPSession(canned={"list_datasources": _DATASOURCES})
+    tools = build_tools(session)
+
+    await tools["query_traces"](traceql='{ resource.service.name = "x" }', limit=5)
+
+    tempo_call = next(c for c in session.calls if c[0] == "tempo_traceql-search")
+    assert tempo_call[1]["datasourceUid"] == "tempo-1"
+    assert tempo_call[1]["query"] == '{ resource.service.name = "x" }'
+    assert tempo_call[1]["limit"] == 5
+
+
+@pytest.mark.anyio
+async def test_dashboard_helpers_route_to_correct_wire_names():
+    session = MockMCPSession(canned={"list_datasources": _DATASOURCES})
+    tools = build_tools(session)
+
+    await tools["get_dashboard"](uid="abc")
+    await tools["save_dashboard"](model={"title": "x"})
+    await tools["search_dashboards"](query="cache")
+
+    wire_names = [c[0] for c in session.calls]
+    assert "get_dashboard_by_uid" in wire_names
+    assert "update_dashboard" in wire_names
+    assert "search_dashboards" in wire_names
+
+
+@pytest.mark.anyio
+async def test_missing_datasource_raises_with_helpful_message():
+    session = MockMCPSession(canned={"list_datasources": [_DATASOURCES[0]]})
+    tools = build_tools(session)
+
+    with pytest.raises(RuntimeError, match="no 'loki' datasource"):
+        await tools["query_logs"](
+            expr='{job="x"}', start="2026-04-25T00:00:00Z", end="2026-04-25T01:00:00Z"
+        )
+
+
+def test_build_o11y_skill_bundles_instructions_and_tools():
+    session = MockMCPSession()
+    skill = build_o11y_skill(session)
+
+    assert skill.name == "o11y"
+    # Sanity: instructions came from instructions.md
+    assert "PromQL" in skill.instructions and "TraceQL" in skill.instructions
+    # All 7 helpers exposed via the skill's tools dict
+    assert len(skill.tools) == 7

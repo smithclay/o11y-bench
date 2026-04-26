@@ -18,6 +18,8 @@ from harbor.environments.base import BaseEnvironment
 from .o11y_agent import O11yBenchAgent
 
 RUNNER_SCRIPT = Path(__file__).parent / "predict_rlm_agent_runner.py"
+SKILL_DIR = Path(__file__).parent / "o11y_skill"
+SKILL_FILES = ("__init__.py", "skill.py", "tools.py", "instructions.md")
 
 
 class PredictRLMO11yAgent(O11yBenchAgent):
@@ -56,8 +58,13 @@ class PredictRLMO11yAgent(O11yBenchAgent):
         return "1.0.0"
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        await environment.exec(command="mkdir -p /app/agents")
+        await environment.exec(command="mkdir -p /app/o11y_skill")
         await environment.upload_file(
             source_path=RUNNER_SCRIPT,
             target_path="/app/agent_runner.py",
         )
+        for filename in SKILL_FILES:
+            await environment.upload_file(
+                source_path=SKILL_DIR / filename,
+                target_path=f"/app/o11y_skill/{filename}",
+            )

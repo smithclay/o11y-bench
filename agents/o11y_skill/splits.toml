@@ -1,0 +1,53 @@
+# Frozen 11/11/11 stratified splits across the 6 o11y-bench categories.
+# Used by scripts/predict_rlm_eval.py and any future RLM♥GEPA optimizer.
+#
+# - `train` is for hand-iteration and (eventual) GEPA proposer trace generation.
+# - `val` is for picking the best skill version. Run after every meaningful change.
+# - `test` is held back for final evaluation after a skill is locked in. Do not
+#   look at it during iteration.
+#
+# Categories per split (3 prom + 2 tempo + 2 investigation + 2 loki + 1 dashboard
+# + 1 grafana_api = 11). Tasks already smoke-tested while developing this PR
+# live in `train` so val/test stay uncontaminated.
+
+train = [
+    "cache-rollout-trigger-check",
+    "dashboard-create-service-overview",
+    "find-slow-requests",
+    "incident-triage",
+    "list-datasources",
+    "list-services-traces",
+    "logql-parse-json-logs",
+    "promql-error-rate",
+    "query-cpu-metrics",
+    "query-memory-usage",
+    "traceql-error-span-analysis",
+]
+
+val = [
+    "check-service-health",
+    "dashboard-add-cache-lag-panels",
+    "deployment-blast-radius-check",
+    "find-slow-traces",
+    "logql-payment-warning-volume",
+    "logql-top-5xx-endpoint",
+    "payment-error-blast-radius",
+    "promql-discover-http-metric",
+    "promql-topk-5xx-share",
+    "search-dashboards",
+    "traceql-checkout-p99-by-service",
+]
+
+test = [
+    "dashboard-repair-cache-review",
+    "dependency-outage-false-lead",
+    "get-datasource-details",
+    "logql-multi-stage-pipeline",
+    "logql-retry-vs-real-errors",
+    "payments-path-root-cause",
+    "promql-burn-rate-assessment",
+    "promql-cache-lag-vs-user-latency",
+    "promql-highest-backend-error-ratio",
+    "trace-error-analysis",
+    "traceql-cross-service-analysis",
+]

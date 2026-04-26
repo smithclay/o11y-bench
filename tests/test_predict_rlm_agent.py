@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from agents.predict_rlm_o11y_agent import RUNNER_SCRIPT, PredictRLMO11yAgent
+from agents.predict_rlm_o11y_agent import (
+    RUNNER_SCRIPT,
+    SKILL_DIR,
+    SKILL_FILES,
+    PredictRLMO11yAgent,
+)
 
 
 def test_agent_identity_strings():
@@ -50,8 +55,14 @@ def test_extra_env_omits_unset_knobs(monkeypatch: pytest.MonkeyPatch):
     assert "TIMEOUT_S" not in agent._extra_env
 
 
+def test_skill_dir_layout():
+    assert SKILL_DIR.is_dir()
+    for filename in SKILL_FILES:
+        assert (SKILL_DIR / filename).is_file(), f"missing skill file: {filename}"
+
+
 @pytest.mark.anyio
-async def test_setup_uploads_runner(tmp_path: Path):
+async def test_setup_uploads_runner_and_skill(tmp_path: Path):
     agent = PredictRLMO11yAgent(logs_dir=tmp_path)
     environment = MagicMock()
     environment.exec = AsyncMock()
@@ -59,11 +70,10 @@ async def test_setup_uploads_runner(tmp_path: Path):
 
     await agent.setup(environment)
 
-    environment.exec.assert_awaited_once_with(command="mkdir -p /app/agents")
-    environment.upload_file.assert_awaited_once_with(
-        source_path=RUNNER_SCRIPT,
-        target_path="/app/agent_runner.py",
-    )
-    assert call(source_path=RUNNER_SCRIPT, target_path="/app/agent_runner.py") in (
-        environment.upload_file.await_args_list
-    )
+    environment.exec.assert_awaited_once_with(command="mkdir -p /app/o11y_skill")
+
+    expected = [
+        call(source_path=RUNNER_SCRIPT, target_path="/app/agent_runner.py"),
+        *(call(source_path=SKILL_DIR / f, target_path=f"/app/o11y_skill/{f}") for f in SKILL_FILES),
+    ]
+    assert environment.upload_file.await_args_list == expected
