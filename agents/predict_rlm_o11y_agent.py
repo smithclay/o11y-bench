@@ -107,6 +107,23 @@ MCP_TOOL_CATALOG: tuple[dict[str, str], ...] = (
 
 # ----- DSPy signature ------------------------------------------------------
 
+_SIGNATURE_CACHE: Any = None
+_SKILLS_CACHE: list[Any] | None = None
+
+
+def _get_signature() -> Any:
+    global _SIGNATURE_CACHE
+    if _SIGNATURE_CACHE is None:
+        _SIGNATURE_CACHE = _build_signature()
+    return _SIGNATURE_CACHE
+
+
+def _get_skills() -> list[Any]:
+    global _SKILLS_CACHE
+    if _SKILLS_CACHE is None:
+        _SKILLS_CACHE = _build_skills()
+    return _SKILLS_CACHE
+
 
 def _build_signature() -> Any:
     """Build the O11ySignature DSPy class.
@@ -286,17 +303,40 @@ def _decode_tool_result(result: Any) -> Any:
 
 
 def build_mcp_tools(session: Any) -> list[Callable[..., Awaitable[Any]]]:
-    """Wrap each Grafana MCP tool as an awaitable Python callable.
+    """Wrap each Grafana MCP tool from ``MCP_TOOL_CATALOG`` as an awaitable callable.
 
-    The catalog is fixed (see ``MCP_TOOL_CATALOG``) so the outer LM always sees
-    the same surface across runs even if the upstream server reorders tools.
-    Tools the server does not actually expose will surface their failure as an
-    exception inside the sandbox, which the outer LM is expected to reason about.
+    Used as the default surface and as the test fixture. For the live agent run,
+    ``discover_mcp_tools`` overlays the server's actual tool list on this catalog.
     """
     return [_make_tool_wrapper(session, entry["name"], entry["doc"]) for entry in MCP_TOOL_CATALOG]
 
 
+async def discover_mcp_tools(session: Any) -> list[Callable[..., Awaitable[Any]]]:
+    """Build wrappers from the server's ``list_tools()`` response.
+
+    Tools whose names appear in ``MCP_TOOL_CATALOG`` keep our hand-tuned docstring;
+    others fall through to the server-supplied description. This way the outer LM
+    always sees the actual tool surface even if mcp-grafana renames or adds tools.
+    """
+    catalog_docs = {entry["name"]: entry["doc"] for entry in MCP_TOOL_CATALOG}
+    response = await session.list_tools()
+    server_tools = getattr(response, "tools", []) or []
+    if not server_tools:
+        return build_mcp_tools(session)
+    wrappers: list[Callable[..., Awaitable[Any]]] = []
+    for tool in server_tools:
+        name = getattr(tool, "name", None)
+        if not name:
+            continue
+        doc = catalog_docs.get(name) or getattr(tool, "description", None) or name
+        wrappers.append(_make_tool_wrapper(session, name, doc))
+    return wrappers
+
+
 # ----- Trajectory conversion ----------------------------------------------
+
+
+_OBSERVATION_CONTENT_LIMIT = 10_000
 
 
 def _atif_step(
@@ -324,6 +364,42 @@ def _atif_step(
     if metrics:
         step["metrics"] = metrics
     return step
+
+
+def _serialize_call_content(value: Any, error: Any) -> str:
+    """Render one tool/predict call's payload for the trajectory.
+
+    Truncated so a single noisy dashboard JSON cannot blow up trajectory.json.
+    """
+    if error is not None:
+        body = f"[error] {error}"
+    else:
+        body = json.dumps(value, default=str)
+    if len(body) > _OBSERVATION_CONTENT_LIMIT:
+        return (
+            body[:_OBSERVATION_CONTENT_LIMIT]
+            + f"... [truncated {len(body) - _OBSERVATION_CONTENT_LIMIT} chars]"
+        )
+    return body
+
+
+def _record_call(
+    *,
+    call_id: str,
+    function_name: str,
+    arguments: dict[str, Any],
+    content: str,
+    atif_tool_calls: list[dict[str, Any]],
+    observation_results: list[dict[str, Any]],
+) -> None:
+    atif_tool_calls.append(
+        {
+            "tool_call_id": call_id,
+            "function_name": function_name,
+            "arguments": arguments,
+        }
+    )
+    observation_results.append({"source_call_id": call_id, "content": content})
 
 
 def _to_atif(
@@ -357,50 +433,38 @@ def _to_atif(
         observation_results: list[dict[str, Any]] = []
 
         for tc in getattr(step, "tool_calls", []) or []:
-            call_id = f"tc-{next_id}-{len(atif_tool_calls)}"
             arguments = {**(getattr(tc, "kwargs", {}) or {})}
             args_pos = list(getattr(tc, "args", []) or [])
             if args_pos:
                 arguments["_args"] = args_pos
-            atif_tool_calls.append(
-                {
-                    "tool_call_id": call_id,
-                    "function_name": getattr(tc, "name", "tool"),
-                    "arguments": arguments,
-                }
-            )
-            observation_results.append(
-                {
-                    "source_call_id": call_id,
-                    "content": json.dumps(getattr(tc, "result", None), default=str)
-                    if getattr(tc, "error", None) is None
-                    else f"[error] {tc.error}",
-                }
+            _record_call(
+                call_id=f"tc-{next_id}-{len(atif_tool_calls)}",
+                function_name=getattr(tc, "name", "tool"),
+                arguments=arguments,
+                content=_serialize_call_content(
+                    getattr(tc, "result", None), getattr(tc, "error", None)
+                ),
+                atif_tool_calls=atif_tool_calls,
+                observation_results=observation_results,
             )
             total_tool_calls += 1
 
         for group in getattr(step, "predict_calls", []) or []:
             sig = getattr(group, "signature", "")
             for call in getattr(group, "calls", []) or []:
-                call_id = f"pc-{next_id}-{len(atif_tool_calls)}"
-                atif_tool_calls.append(
-                    {
-                        "tool_call_id": call_id,
-                        "function_name": "predict",
-                        "arguments": {
-                            "signature": sig,
-                            "instructions": getattr(group, "instructions", None),
-                            "input": getattr(call, "input", {}) or {},
-                        },
-                    }
-                )
-                observation_results.append(
-                    {
-                        "source_call_id": call_id,
-                        "content": json.dumps(getattr(call, "output", {}), default=str)
-                        if getattr(call, "error", None) is None
-                        else f"[error] {call.error}",
-                    }
+                _record_call(
+                    call_id=f"pc-{next_id}-{len(atif_tool_calls)}",
+                    function_name="predict",
+                    arguments={
+                        "signature": sig,
+                        "instructions": getattr(group, "instructions", None),
+                        "input": getattr(call, "input", {}) or {},
+                    },
+                    content=_serialize_call_content(
+                        getattr(call, "output", {}), getattr(call, "error", None)
+                    ),
+                    atif_tool_calls=atif_tool_calls,
+                    observation_results=observation_results,
                 )
                 total_tool_calls += 1
 
@@ -578,7 +642,7 @@ class PredictRLMO11yAgent(BaseAgent):
                 max_steps=max_steps,
                 timeout_s=timeout_s,
             )
-        except Exception as exc:  # graded failure beats a crash.
+        except Exception as exc:
             self.logger.exception("predict-rlm run failed")
             partial_trace = getattr(exc, "trace", None)
             self._write_failure(
@@ -659,13 +723,13 @@ async def _drive_predict_rlm(
     from mcp.client.streamable_http import streamable_http_client
     from predict_rlm import PredictRLM
 
-    signature_cls = _build_signature()
-    skills = _build_skills()
+    signature_cls = _get_signature()
+    skills = _get_skills()
 
     async with streamable_http_client(mcp_url) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            tools = build_mcp_tools(session)
+            tools = await discover_mcp_tools(session)
 
             rlm = PredictRLM(
                 signature_cls,

@@ -12,22 +12,32 @@ from harbor.models.agent.context import AgentContext
 from agents.predict_rlm_o11y_agent import (
     MCP_TOOL_CATALOG,
     PredictRLMO11yAgent,
+    _serialize_call_content,
     _to_atif,
     build_mcp_tools,
+    discover_mcp_tools,
 )
 
 
 class MockMCPSession:
     """Duck-typed MCP client that records call_tool invocations."""
 
-    def __init__(self, canned: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        canned: dict[str, Any] | None = None,
+        server_tools: list[Any] | None = None,
+    ) -> None:
         self.canned = canned or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.server_tools = server_tools or []
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         self.calls.append((name, dict(arguments)))
         payload = self.canned.get(name, {"ok": True, "name": name, "args": arguments})
         return SimpleNamespace(content=[SimpleNamespace(text=json.dumps(payload))])
+
+    async def list_tools(self) -> Any:
+        return SimpleNamespace(tools=self.server_tools)
 
 
 def test_build_mcp_tools_returns_expected_catalog():
@@ -62,6 +72,46 @@ async def test_built_tools_proxy_to_session_call_tool():
         )
     ]
     assert result == {"data": {"result": [{"value": [0, "42"]}]}}
+
+
+@pytest.mark.anyio
+async def test_discover_mcp_tools_overlays_catalog_docs_on_live_tools():
+    session = MockMCPSession(
+        server_tools=[
+            SimpleNamespace(name="query_prometheus", description="server desc"),
+            SimpleNamespace(name="new_server_only", description="server-only doc"),
+        ]
+    )
+
+    tools = await discover_mcp_tools(session)
+    by_name = {tool.__name__: tool for tool in tools}
+
+    assert set(by_name) == {"query_prometheus", "new_server_only"}
+    # Catalog tool keeps the hand-tuned docstring
+    assert "PromQL expression" in by_name["query_prometheus"].__doc__
+    # Server-only tool falls through to the live description
+    assert by_name["new_server_only"].__doc__ == "server-only doc"
+
+
+@pytest.mark.anyio
+async def test_discover_mcp_tools_falls_back_to_catalog_when_server_lists_none():
+    session = MockMCPSession(server_tools=[])
+
+    tools = await discover_mcp_tools(session)
+
+    assert len(tools) == len(MCP_TOOL_CATALOG)
+
+
+def test_serialize_call_content_truncates_large_payloads():
+    huge = {"data": "x" * 50_000}
+    serialized = _serialize_call_content(huge, error=None)
+    assert "truncated" in serialized
+    assert len(serialized) < 12_000
+
+
+def test_serialize_call_content_renders_errors_inline():
+    serialized = _serialize_call_content(None, error="connection reset")
+    assert serialized == "[error] connection reset"
 
 
 def test_agent_identity_strings():
