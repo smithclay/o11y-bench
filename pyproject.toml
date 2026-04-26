@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.0",
     "promql-parser>=0.7.0",
     "pyyaml>=6.0",
+    "gepa>=0.0.26",
 ]
 
 [dependency-groups]

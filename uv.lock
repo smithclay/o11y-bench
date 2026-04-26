@@ -1503,6 +1503,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "gepa" },
     { name = "harbor" },
     { name = "markdown" },
     { name = "predict-rlm" },
@@ -1523,6 +1524,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40" },
+    { name = "gepa", specifier = ">=0.0.26" },
     { name = "harbor", specifier = "==0.3.0" },
     { name = "markdown", specifier = ">=3.10" },
     { name = "predict-rlm", specifier = ">=0.3.0" },

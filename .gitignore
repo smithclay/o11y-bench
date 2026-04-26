@@ -30,3 +30,7 @@ tasks-level2/
 .results-archive
 .cache
 .agents
+
+# GEPA optimizer scratch — instructions.md is canonical; evolved/.bak are per-run.
+agents/o11y_skill/instructions.evolved.md
+agents/o11y_skill/instructions.seed.md.bak
