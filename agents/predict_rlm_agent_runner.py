@@ -18,9 +18,11 @@ Config via env vars:
 - ``MODEL`` — outer LM (e.g. ``anthropic/claude-opus-4-7``)
 - ``SUB_MODEL`` — structured-extraction sub-LM (default
   ``anthropic/claude-haiku-4-5``)
-- ``MAX_STEPS`` — REPL iteration cap (default 30)
+- ``MAX_STEPS`` — REPL iteration cap (default 50)
 - ``TIMEOUT_S`` — wall-clock cap for the RLM call (default 600)
 - ``MCP_URL`` — Grafana MCP endpoint (default ``http://$STACK_HOST:8080/mcp``)
+- ``O11Y_SCENARIO_TIME_ISO`` — synthetic scenario clock; surfaced to the LM as
+  the ``Current time`` in a ``<context>`` block prepended to the instruction.
 
 The ``deno`` binary required by predict-rlm's Pyodide sandbox is provided by
 the ``deno`` PyPI wheel (a transitive dep of ``predict-rlm``); ``uv run`` puts
@@ -43,71 +45,8 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_SUB_MODEL = "anthropic/claude-haiku-4-5"
-DEFAULT_MAX_STEPS = 30
+DEFAULT_MAX_STEPS = 50
 DEFAULT_TIMEOUT_S = 600
-
-# Catalog of mcp-grafana tools the outer LM should know about. The catalog
-# stays static so prompt strings (docstrings) are stable across runs even if
-# the upstream MCP server reorders or extends its surface. Tools the server
-# does not actually expose surface as exceptions inside the sandbox.
-MCP_TOOL_CATALOG: tuple[dict[str, str], ...] = (
-    {
-        "name": "list_datasources",
-        "doc": (
-            "List the Grafana datasources available in this stack.\n\n"
-            "Returns a list of dicts with at least ``uid``, ``name``, and ``type`` "
-            "(``prometheus``/``loki``/``tempo``)."
-        ),
-    },
-    {
-        "name": "query_prometheus",
-        "doc": (
-            "Run a PromQL query against the Prometheus datasource.\n\n"
-            "Args:\n"
-            "    expr: PromQL expression. Use rate()/increase() for counters and\n"
-            "        histogram_quantile(sum by (le) (rate(_bucket[range]))) for percentiles.\n"
-            "    start, end: ISO-8601 strings. When supplied, runs a range query.\n"
-            "        Omit both for an instant query at scenario-now.\n"
-            "    step: range step (default '30s').\n"
-            "Returns: the raw Prometheus result body."
-        ),
-    },
-    {
-        "name": "query_loki",
-        "doc": (
-            "Run a LogQL query against the Loki datasource.\n\n"
-            "Args:\n"
-            "    expr: LogQL expression. Put the smallest viable label matcher first,\n"
-            "        line filters second, parsers last.\n"
-            "    start, end: ISO-8601 strings.\n"
-            "    limit: max log lines (default 100)."
-        ),
-    },
-    {
-        "name": "query_tempo",
-        "doc": (
-            "Run a TraceQL query against the Tempo datasource.\n\n"
-            "Filter by ``resource.service.name`` and ``span.status`` before duration;\n"
-            "use ``| select(...)`` to project the fields you actually need."
-        ),
-    },
-    {
-        "name": "get_dashboard",
-        "doc": "Fetch the full dashboard JSON for ``uid``.",
-    },
-    {
-        "name": "update_dashboard",
-        "doc": (
-            "Save a full dashboard model. Pass the entire panel JSON, not a patch.\n"
-            "Always re-fetch with ``get_dashboard`` after saving and verify that\n"
-            "the saved expression and variable bindings match intent."
-        ),
-    },
-    {
-        "name": "search_dashboards",
-        "doc": "Search dashboards by title/tag substring; returns a list of metadata dicts.",
-    },
-)
 
 
 def build_signature() -> Any:
@@ -117,8 +56,10 @@ def build_signature() -> Any:
         """Solve a Grafana observability task by composing MCP tool calls in Python.
 
         Strategy:
-        1. Survey datasources once via ``await list_datasources()``. Do not
-           enumerate every metric or log stream — that path leads to context rot.
+        1. Survey datasources once via ``await list_datasources()``. Cache the
+           ``uid`` per type — every query tool requires ``datasource_uid``.
+           Do not enumerate every metric or log stream — that path leads to
+           context rot.
         2. Identify the single signal that answers the question before issuing
            queries. Resist the urge to gather breadth.
         3. PromQL idioms:
@@ -156,6 +97,24 @@ def build_signature() -> Any:
 
 def build_skills() -> list[Any]:
     from predict_rlm import Skill
+
+    mcp = Skill(
+        name="mcp",
+        instructions=(
+            "mcp-grafana tool conventions:\n"
+            "- ALWAYS call `list_datasources()` first and remember the `uid` for each\n"
+            "  datasource type (`prometheus`, `loki`, `tempo`). Every query tool\n"
+            "  requires a `datasource_uid` argument; calls without it return HTTP 400.\n"
+            "- The arg names and required fields shown in each tool's docstring (under\n"
+            "  `Input schema:`) are authoritative — do not guess. Pass everything as\n"
+            "  keyword args (e.g. `await query_prometheus(datasource_uid='prometheus', "
+            "expr='up')`).\n"
+            "- The `<context>` block in the user message gives the synthetic `Current "
+            "time:` —\n"
+            "  derive explicit `start`/`end` ISO-8601 bounds from it for time-windowed\n"
+            "  queries instead of relying on the wall clock."
+        ),
+    )
 
     promql = Skill(
         name="promql",
@@ -229,7 +188,7 @@ def build_skills() -> list[Any]:
         ),
     )
 
-    return [promql, logql, traceql, dashboard]
+    return [mcp, promql, logql, traceql, dashboard]
 
 
 def _decode_tool_result(result: Any) -> Any:
@@ -252,19 +211,85 @@ def _decode_tool_result(result: Any) -> Any:
         return joined
 
 
-def _make_tool_wrapper(session: Any, tool_name: str, doc: str) -> Callable[..., Awaitable[Any]]:
+def _format_tool_doc(description: str | None, input_schema: Any) -> str:
+    """Compose a tool docstring the LM can read: NL description + JSON schema.
+
+    The schema (including ``datasource_uid``, required fields, types, enums) is
+    the source of truth; predict-rlm's outer LM reads the docstring as plain
+    text when reasoning about which kwargs to pass.
+    """
+    base = (description or "").strip()
+    if isinstance(input_schema, dict) and input_schema:
+        schema_text = json.dumps(input_schema, indent=2, sort_keys=True)
+        return f"{base}\n\nInput schema:\n```json\n{schema_text}\n```".strip()
+    return base or "(no description)"
+
+
+def _safe_identifier(name: str) -> str:
+    """Map an MCP tool name to a valid Python identifier (predict-rlm requires
+    sandbox tools to be valid identifiers). Non-identifier chars become ``_``;
+    a leading digit is prefixed with ``t_``."""
+    safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in name)
+    if safe and safe[0].isdigit():
+        safe = f"t_{safe}"
+    return safe or "tool"
+
+
+def _make_tool_wrapper(
+    session: Any, wire_name: str, py_name: str, doc: str
+) -> Callable[..., Awaitable[Any]]:
     async def _tool(**kwargs: Any) -> Any:
-        result = await session.call_tool(tool_name, kwargs)
+        result = await session.call_tool(wire_name, kwargs)
         return _decode_tool_result(result)
 
-    _tool.__name__ = tool_name
-    _tool.__qualname__ = tool_name
+    _tool.__name__ = py_name
+    _tool.__qualname__ = py_name
     _tool.__doc__ = doc
     return _tool
 
 
-def build_mcp_tools(session: Any) -> list[Callable[..., Awaitable[Any]]]:
-    return [_make_tool_wrapper(session, e["name"], e["doc"]) for e in MCP_TOOL_CATALOG]
+async def discover_mcp_tools(
+    session: Any,
+) -> tuple[list[Callable[..., Awaitable[Any]]], list[dict[str, Any]]]:
+    """Discover the live mcp-grafana tool surface and build async wrappers.
+
+    Returns ``(callables, tool_definitions)`` where ``tool_definitions`` is the
+    flat name/description list embedded in the ATIF trajectory's
+    ``agent.tool_definitions``. Mirrors the pattern in ``agent_runner.py``
+    (the default agent's litellm path) but produces Python callables for the
+    predict-rlm sandbox instead of OpenAI function-call specs. MCP names that
+    are not valid Python identifiers (e.g. ``tempo_docs-traceql``) get
+    rewritten for the LM-facing surface; the wire name is preserved for
+    ``session.call_tool``.
+    """
+    result = await session.list_tools()
+    callables: list[Callable[..., Awaitable[Any]]] = []
+    definitions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for tool in result.tools:
+        wire_name = tool.name
+        py_name = _safe_identifier(wire_name)
+        if py_name in seen:
+            i = 2
+            while f"{py_name}_{i}" in seen:
+                i += 1
+            py_name = f"{py_name}_{i}"
+        seen.add(py_name)
+        doc = _format_tool_doc(
+            getattr(tool, "description", None), getattr(tool, "inputSchema", None)
+        )
+        if py_name != wire_name:
+            doc = f"(MCP wire name: ``{wire_name}``)\n\n{doc}"
+        callables.append(_make_tool_wrapper(session, wire_name, py_name, doc))
+        definitions.append(
+            {
+                "name": wire_name,
+                "description": (getattr(tool, "description", None) or "").splitlines()[0]
+                if getattr(tool, "description", None)
+                else "",
+            }
+        )
+    return callables, definitions
 
 
 def _atif_step(
@@ -301,6 +326,7 @@ def to_atif(
     trace: Any,
     model_name: str,
     sub_model_name: str,
+    tool_definitions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     steps: list[dict[str, Any]] = [
         _atif_step(1, "system", "predict-rlm o11y-bench agent (see O11ySignature docstring)"),
@@ -417,10 +443,7 @@ def to_atif(
             "version": agent_version,
             "model_name": model_name,
             "sub_model_name": sub_model_name,
-            "tool_definitions": [
-                {"name": e["name"], "description": e["doc"].splitlines()[0]}
-                for e in MCP_TOOL_CATALOG
-            ],
+            "tool_definitions": tool_definitions or [],
         },
         "steps": steps,
         "final_metrics": {
@@ -437,46 +460,34 @@ def to_atif(
     }
 
 
-def _log(msg: str) -> None:
-    print(f"[runner] {msg}", file=sys.stderr, flush=True)
-
-
 async def drive(
     *,
-    instruction: str,
+    prompt: str,
     mcp_url: str,
     outer_model: str,
     sub_model: str,
     max_steps: int,
     timeout_s: int,
-) -> tuple[str, Any]:
-    _log("importing predict-rlm + mcp")
+) -> tuple[str, Any, list[dict[str, Any]]]:
     from mcp.client.session import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
     from predict_rlm import PredictRLM
     from predict_rlm.interpreter import JspiInterpreter
 
-    _log("building signature + skills")
     signature_cls = build_signature()
     skills = build_skills()
 
-    _log(f"connecting MCP {mcp_url}")
     async with streamablehttp_client(mcp_url) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            _log("MCP session initialized; building tools")
-            tools = build_mcp_tools(session)
+            tools, tool_definitions = await discover_mcp_tools(session)
 
-            _log("booting JspiInterpreter (Pyodide via deno)")
             # Do NOT pass deno_command — JspiInterpreter only auto-adds the
             # required JSPI flags when it builds the deno command itself.
             # Without those flags the sandbox→host async tool bridge silently
             # deadlocks on the first tool call. uv puts the deno binary on
             # PATH for `uv run` execution, so auto-discovery works.
             interpreter = JspiInterpreter(preinstall_packages=False)
-            _log(
-                f"creating PredictRLM (outer={outer_model}, sub={sub_model}, max_steps={max_steps})"
-            )
             rlm = PredictRLM(
                 signature_cls,
                 lm=outer_model,
@@ -485,17 +496,14 @@ async def drive(
                 tools=tools,
                 skills=skills,
                 interpreter=interpreter,
-                verbose=True,
             )
-            _log(f"running aforward (timeout={timeout_s}s)")
             prediction = await asyncio.wait_for(
-                rlm.aforward(instruction=instruction),
+                rlm.aforward(instruction=prompt),
                 timeout=timeout_s,
             )
-            _log("aforward completed")
             answer = (getattr(prediction, "answer", None) or "").strip()
             trace = getattr(prediction, "trace", None)
-            return answer, trace
+            return answer, trace, tool_definitions
 
 
 def _resolve_int_env(name: str, default: int) -> int:
@@ -506,6 +514,16 @@ def _resolve_int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _build_prompt(instruction: str) -> str:
+    """Mirror ``agents/task_prompt.txt``: prepend a ``<context>`` block carrying
+    the synthetic scenario clock so time-bounded queries derive their bounds
+    from the simulated stack's clock, not the wall clock."""
+    env_ts = os.environ.get("O11Y_SCENARIO_TIME_ISO", "").strip()
+    if not env_ts:
+        return instruction
+    return f"<context>\nCurrent time: {env_ts}\n</context>\n\n{instruction}"
 
 
 async def run() -> int:
@@ -520,12 +538,14 @@ async def run() -> int:
     agent_dir = Path("/logs/agent")
     agent_dir.mkdir(parents=True, exist_ok=True)
 
+    prompt = _build_prompt(instruction)
+
     exit_code = 0
     trace: Any = None
+    tool_definitions: list[dict[str, Any]] = []
     try:
-        _log(f"starting; mcp_url={mcp_url} max_steps={max_steps} timeout={timeout_s}s")
-        answer, trace = await drive(
-            instruction=instruction,
+        answer, trace, tool_definitions = await drive(
+            prompt=prompt,
             mcp_url=mcp_url,
             outer_model=outer_model,
             sub_model=sub_model,
@@ -539,11 +559,12 @@ async def run() -> int:
         exit_code = 1
 
     trajectory = to_atif(
-        instruction=instruction,
+        instruction=prompt,
         answer=answer,
         trace=trace,
         model_name=outer_model,
         sub_model_name=sub_model,
+        tool_definitions=tool_definitions,
     )
     if exit_code != 0:
         trajectory["final_metrics"]["status"] = "error"
