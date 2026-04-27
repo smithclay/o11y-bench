@@ -59,6 +59,14 @@ re-runs reference queries; mismatches lose points.
   Cardinality matters.
 - Peek at a few raw lines before parsing (`limit=5`, no parser) so you know the
   actual log shape before you commit to extraction code.
+- **For "how many" / count questions, run an aggregation query** —
+  `sum(count_over_time({selector}[range]))` or
+  `sum by (label) (count_over_time({selector}[range]))` — pass that to
+  `query_logs`. **Do not** count the lines returned from a plain log
+  fetch: `query_logs` caps results at `limit=100` by default, and even
+  with a high limit you'll typically undercount or overcount versus the
+  canonical aggregation the grader runs. The aggregation returns the
+  true count.
 - Aggregations: `sum by (label) (count_over_time({...}[5m]))` for counts,
   `sum by (label) (rate({...}[5m]))` for per-second rates.
 - For numeric extraction, `| json | unwrap field | rate(...)` works on numeric
@@ -80,11 +88,19 @@ re-runs reference queries; mismatches lose points.
 
 ## Dashboard editing
 
-- Round-trip the whole panel JSON: `await get_dashboard(uid)` → mutate →
-  `await save_dashboard(model)`. Never construct a partial dashboard.
-- After saving, ALWAYS re-fetch with `get_dashboard(uid)` and assert the saved
-  expression / panel title / unit / variable binding actually matches what you
-  intended. Saves can fail silently if the schema is off.
+- **Round-trip the whole model.** Start with
+  `current = await get_dashboard(uid)`, mutate `current` in place (e.g.
+  `current["panels"].append(new_panel)`), then pass `current` —
+  *unchanged except for your edits* — to
+  `await save_dashboard(current)`. Do NOT construct a fresh dict like
+  `{"panels": [...]}` from scratch: the dashboard model also needs
+  `title`, `uid`, `version`, `templating`, `time`, `annotations`, etc.
+  Building a partial drops those fields and `save_dashboard` fails with
+  errors like *"Dashboard title cannot be empty"*. `get_dashboard` is
+  the source of truth for the baseline shape.
+- After saving, re-fetch with `get_dashboard(uid)` and assert the saved
+  expression / panel title / unit / variable binding actually matches
+  what you intended. Saves can fail silently if the schema is off.
 - Variables live at `dashboard.templating.list[*]`. A panel's
   `targets[*].expr` must reference variables that exist there.
 - Dashboard uids and folder uids share a namespace. Don't collide them.
