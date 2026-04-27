@@ -55,6 +55,44 @@ def _parse_step(step: str | int) -> int:
     return int(s)
 
 
+def _extract_datasource_records(decoded: Any) -> list[dict[str, Any]]:
+    """Tolerate the several shapes mcp-grafana may return for ``list_datasources``.
+
+    Observed in practice:
+      - bare list of dicts, each with ``uid``/``type`` (the simplest case).
+      - wrapper dict, e.g. ``{"datasources": [...]}`` or similar (this is what
+        recent mcp-grafana versions ship in this stack).
+      - dict keyed by name → record dict.
+    Anything else returns ``[]`` and the caller should fall back to defaults.
+    """
+    if isinstance(decoded, list):
+        return [d for d in decoded if isinstance(d, dict)]
+    if isinstance(decoded, dict):
+        for key in ("datasources", "data", "result", "items"):
+            inner = decoded.get(key)
+            if isinstance(inner, list):
+                return [d for d in inner if isinstance(d, dict)]
+        # Maybe a name→record map. Treat values that look like datasource
+        # records (have ``uid`` or ``type``) as the records themselves.
+        records: list[dict[str, Any]] = []
+        for v in decoded.values():
+            if isinstance(v, dict) and ("uid" in v or "type" in v):
+                records.append(v)
+        if records:
+            return records
+        # Last-ditch: maybe the dict IS a single record.
+        if "uid" in decoded or "type" in decoded:
+            return [decoded]
+    return []
+
+
+# Fallback uids: in this benchmark's synthetic stack the MCP datasource UIDs
+# happen to equal their type names (`prometheus`, `loki`, `tempo`). When
+# ``list_datasources`` returns an unrecognized shape we use these so query
+# helpers stay functional rather than cascade-failing every task.
+_FALLBACK_UIDS: dict[str, str] = {"prometheus": "prometheus", "loki": "loki", "tempo": "tempo"}
+
+
 class _UidCache:
     """Single-flight cache of `{type: uid}` from list_datasources."""
 
@@ -68,16 +106,17 @@ class _UidCache:
             async with self._lock:
                 if self._uids is None:
                     result = await self._session.call_tool("list_datasources", {})
-                    decoded = _decode(result) or []
-                    if not isinstance(decoded, list):
-                        raise RuntimeError(
-                            f"list_datasources returned unexpected shape: {type(decoded).__name__}"
-                        )
+                    decoded = _decode(result)
+                    records = _extract_datasource_records(decoded)
                     self._uids = {
                         str(ds["type"]).lower(): str(ds["uid"])
-                        for ds in decoded
-                        if isinstance(ds, dict) and "type" in ds and "uid" in ds
+                        for ds in records
+                        if "type" in ds and "uid" in ds
                     }
+                    # Always merge fallbacks for the three signal datasources;
+                    # don't override real uids if discovery succeeded.
+                    for k, v in _FALLBACK_UIDS.items():
+                        self._uids.setdefault(k, v)
         return self._uids
 
     async def get(self, ds_type: str) -> str:

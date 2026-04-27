@@ -89,6 +89,22 @@ re-runs reference queries; mismatches lose points.
   `targets[*].expr` must reference variables that exist there.
 - Dashboard uids and folder uids share a namespace. Don't collide them.
 
+## Never fabricate
+
+The grader re-runs the canonical query and compares your numeric answer.
+A made-up plausible-looking number scores **zero**, the same as no answer.
+
+- **Never** use `await predict(...)` to invent or summarize *numeric* values
+  that should come from a query. `predict()` is for structured *extraction*
+  from real query results, not for generating answers when queries fail.
+- If queries fail or return empty data after a real attempt, say so
+  explicitly in the answer (e.g. *"queried `process_cpu_seconds_total` over
+  the 6h window; result was empty — no CPU data available for that
+  metric/window"*) instead of inventing values.
+- If a tool helper raises an unexpected error, surface the error message in
+  your answer so the user/grader can see what actually happened, instead of
+  paraphrasing the failure as a high-level "infrastructure issue".
+
 ## Answer formatting
 
 - Concise. The grader rubric scores literal text against weighted criteria.

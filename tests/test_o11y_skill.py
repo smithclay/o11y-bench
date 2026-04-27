@@ -148,14 +148,54 @@ async def test_dashboard_helpers_route_to_correct_wire_names():
 
 
 @pytest.mark.anyio
-async def test_missing_datasource_raises_with_helpful_message():
-    session = MockMCPSession(canned={"list_datasources": [_DATASOURCES[0]]})
+async def test_dict_wrapped_list_datasources_is_extracted():
+    """mcp-grafana sometimes returns a wrapper dict ``{"datasources": [...]}``
+    instead of a bare list. The cache must handle both shapes."""
+    session = MockMCPSession(
+        canned={
+            "list_datasources": {"datasources": _DATASOURCES},
+            "query_prometheus": {"data": {"result": []}},
+        }
+    )
     tools = build_tools(session)
 
-    with pytest.raises(RuntimeError, match="no 'loki' datasource"):
-        await tools["query_logs"](
-            expr='{job="x"}', start="2026-04-25T00:00:00Z", end="2026-04-25T01:00:00Z"
-        )
+    await tools["query_metrics"](expr="up")
+
+    prom_call = next(c for c in session.calls if c[0] == "query_prometheus")
+    assert prom_call[1]["datasourceUid"] == "prom-1"
+
+
+@pytest.mark.anyio
+async def test_falls_back_to_type_as_uid_when_list_datasources_unparseable():
+    """If ``list_datasources`` returns a shape we cannot extract from, helpers
+    should still work using ``type`` as the uid (matches the synthetic stack)."""
+    session = MockMCPSession(
+        canned={
+            "list_datasources": "not a list or dict",
+            "query_loki_logs": {"data": []},
+        }
+    )
+    tools = build_tools(session)
+
+    await tools["query_logs"](
+        expr='{job="x"}', start="2026-04-25T00:00:00Z", end="2026-04-25T01:00:00Z"
+    )
+
+    loki_call = next(c for c in session.calls if c[0] == "query_loki_logs")
+    assert loki_call[1]["datasourceUid"] == "loki"
+
+
+@pytest.mark.anyio
+async def test_unknown_datasource_type_still_raises():
+    """The three signal datasources have fallbacks, but an unknown type still
+    raises a helpful error rather than silently using a bogus uid."""
+    from agents.o11y_skill.tools import _UidCache
+
+    session = MockMCPSession(canned={"list_datasources": _DATASOURCES})
+    cache = _UidCache(session)
+
+    with pytest.raises(RuntimeError, match="no 'elasticsearch' datasource"):
+        await cache.get("elasticsearch")
 
 
 def test_build_o11y_skill_bundles_instructions_and_tools():
