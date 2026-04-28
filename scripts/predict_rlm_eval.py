@@ -54,6 +54,7 @@ def run_task(
     job_name: str,
     max_steps: int,
     timeout_s: int,
+    n_attempts: int = 1,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         "mise",
@@ -69,7 +70,7 @@ def run_task(
         "--n-concurrent",
         "1",
         "--n-attempts",
-        "1",
+        str(n_attempts),
         "--job-name",
         job_name,
     ]
@@ -82,42 +83,83 @@ def run_task(
 
 
 def parse_trial(job_dir: Path) -> dict[str, Any]:
-    """Read result.json + the (single) trial's trajectory.json."""
+    """Aggregate all trials in a job dir (n_attempts may be > 1).
+
+    Returns per-attempt rewards, mean, min, max, plus aggregated cost and the
+    final trajectory's status/iterations/tool_calls (best-effort across
+    attempts — uses the first trial for those).
+    """
     result_path = job_dir / "result.json"
     if not result_path.exists():
-        return {"reward": None, "status": "missing-result", "trial_dir": None}
+        return {
+            "reward": None,
+            "rewards_per_attempt": [],
+            "status": "missing-result",
+            "trial_dir": None,
+        }
 
     result = json.loads(result_path.read_text())
     evals = result.get("stats", {}).get("evals", {})
-    reward: float | None = None
-    trial_dir_name: str | None = None
+    rewards_per_trial: list[tuple[str, float]] = []
     for ev in evals.values():
         for r_str, trials in ev.get("reward_stats", {}).get("reward", {}).items():
             try:
-                reward = float(r_str)
+                r = float(r_str)
             except ValueError:
                 continue
-            if trials:
-                trial_dir_name = trials[0]
-            break
-        if trial_dir_name:
-            break
+            for t in trials or []:
+                rewards_per_trial.append((str(t), r))
 
-    fm: dict[str, Any] = {}
-    if trial_dir_name:
-        traj_path = job_dir / trial_dir_name / "agent" / "trajectory.json"
-        if traj_path.exists():
-            fm = json.loads(traj_path.read_text()).get("final_metrics", {}) or {}
+    rewards = [r for _, r in rewards_per_trial]
+    mean_reward = sum(rewards) / len(rewards) if rewards else None
+    min_reward = min(rewards) if rewards else None
+    max_reward = max(rewards) if rewards else None
+
+    # Aggregate metrics across attempts: sum cost, max iter/calls (most-work attempt).
+    total_cost = 0.0
+    total_iter = 0
+    total_calls = 0
+    in_tokens = 0
+    out_tokens = 0
+    statuses: list[str] = []
+    first_trial: str | None = None
+    for trial_name, _ in rewards_per_trial:
+        if first_trial is None:
+            first_trial = trial_name
+        traj = job_dir / trial_name / "agent" / "trajectory.json"
+        if traj.is_file():
+            fm = json.loads(traj.read_text()).get("final_metrics", {}) or {}
+            total_cost += float(fm.get("total_cost_usd") or 0.0)
+            total_iter = max(total_iter, int(fm.get("total_iterations") or 0))
+            total_calls = max(total_calls, int(fm.get("total_tool_calls") or 0))
+            in_tokens += int(fm.get("total_prompt_tokens") or 0)
+            out_tokens += int(fm.get("total_completion_tokens") or 0)
+            if fm.get("status"):
+                statuses.append(str(fm["status"]))
+
+    # Combined status: error wins, then max_iterations, else completed
+    if statuses:
+        if any(s == "error" for s in statuses):
+            agg_status = "error"
+        elif any(s == "max_iterations" for s in statuses):
+            agg_status = "max_iterations"
+        else:
+            agg_status = statuses[0]
+    else:
+        agg_status = None
 
     return {
-        "reward": reward,
-        "status": fm.get("status"),
-        "iterations": fm.get("total_iterations", 0),
-        "tool_calls": fm.get("total_tool_calls", 0),
-        "cost_usd": fm.get("total_cost_usd", 0.0),
-        "in_tokens": fm.get("total_prompt_tokens", 0),
-        "out_tokens": fm.get("total_completion_tokens", 0),
-        "trial_dir": trial_dir_name,
+        "reward": mean_reward,
+        "rewards_per_attempt": rewards,
+        "min_reward": min_reward,
+        "max_reward": max_reward,
+        "status": agg_status,
+        "iterations": total_iter,
+        "tool_calls": total_calls,
+        "cost_usd": total_cost,
+        "in_tokens": in_tokens,
+        "out_tokens": out_tokens,
+        "trial_dir": first_trial,
     }
 
 
@@ -141,6 +183,18 @@ def main() -> int:
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--timeout-s", type=int, default=DEFAULT_TIMEOUT_S)
     parser.add_argument(
+        "--n-attempts",
+        type=int,
+        default=1,
+        help="Trials per task. n>1 enables Pass^k / Pass@k stats.",
+    )
+    parser.add_argument(
+        "--pass-threshold",
+        type=float,
+        default=1.0,
+        help="Reward threshold for 'pass' (default 1.0 = full credit).",
+    )
+    parser.add_argument(
         "--limit", type=int, default=None, help="run only the first N tasks (for smoke)"
     )
     parser.add_argument(
@@ -159,9 +213,16 @@ def main() -> int:
     eval_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"# predict-rlm eval — split={args.split} model={args.model}")
-    print(f"eval id: `{eval_id}`  ({len(tasks)} task(s))\n")
-    print("| task | reward | cost | iter | tool_calls | status |")
-    print("|---|---|---|---|---|---|")
+    print(
+        f"eval id: `{eval_id}`  ({len(tasks)} task(s) x {args.n_attempts} attempt(s),"
+        f" pass-threshold={args.pass_threshold})\n"
+    )
+    if args.n_attempts > 1:
+        print("| task | mean | min | max | rewards | cost |")
+        print("|---|---|---|---|---|---|")
+    else:
+        print("| task | reward | cost | iter | tool_calls | status |")
+        print("|---|---|---|---|---|---|")
     sys.stdout.flush()
 
     rows: list[dict[str, Any]] = []
@@ -175,12 +236,14 @@ def main() -> int:
             job_name=job_name,
             max_steps=args.max_steps,
             timeout_s=args.timeout_s,
+            n_attempts=args.n_attempts,
         )
         job_dir = JOBS_DIR / job_name
         if proc.returncode != 0 and not job_dir.exists():
             row = {
                 "task": task_id,
                 "reward": None,
+                "rewards_per_attempt": [],
                 "status": "harness-error",
                 "iterations": 0,
                 "tool_calls": 0,
@@ -194,14 +257,26 @@ def main() -> int:
             parsed = parse_trial(job_dir)
             row = {"task": task_id, **parsed}
         rows.append(row)
-        print(
-            f"| {task_id} | {fmt_reward(row['reward'])} "
-            f"| {fmt_cost(row.get('cost_usd'))} "
-            f"| {row.get('iterations', 0)} "
-            f"| {row.get('tool_calls', 0)} "
-            f"| {row.get('status') or '—'} |",
-            flush=True,
-        )
+        if args.n_attempts > 1:
+            attempts = row.get("rewards_per_attempt") or []
+            attempts_str = ",".join(f"{r:.2f}" for r in attempts) or "—"
+            print(
+                f"| {task_id} | {fmt_reward(row['reward'])} "
+                f"| {fmt_reward(row.get('min_reward'))} "
+                f"| {fmt_reward(row.get('max_reward'))} "
+                f"| {attempts_str} "
+                f"| {fmt_cost(row.get('cost_usd'))} |",
+                flush=True,
+            )
+        else:
+            print(
+                f"| {task_id} | {fmt_reward(row['reward'])} "
+                f"| {fmt_cost(row.get('cost_usd'))} "
+                f"| {row.get('iterations', 0)} "
+                f"| {row.get('tool_calls', 0)} "
+                f"| {row.get('status') or '—'} |",
+                flush=True,
+            )
 
     elapsed_s = time.monotonic() - started
 
@@ -213,9 +288,33 @@ def main() -> int:
         1 for r in rows if r.get("status") in ("error", "harness-error", "missing-result")
     )
 
+    # Pass^k / Pass@k stats when n_attempts > 1.
+    pass_at_k = pass_pow_k = None
+    if args.n_attempts > 1:
+        thr = args.pass_threshold
+        pass_at_k = sum(
+            1 for r in rows if r.get("rewards_per_attempt") and max(r["rewards_per_attempt"]) >= thr
+        )
+        pass_pow_k = sum(
+            1
+            for r in rows
+            if r.get("rewards_per_attempt")
+            and len(r["rewards_per_attempt"]) == args.n_attempts
+            and min(r["rewards_per_attempt"]) >= thr
+        )
+
     print()
     print(f"**mean reward**: {mean_reward:.3f}  ({len(rewards)}/{len(rows)} graded)")
     print(f"**non-zero rewards**: {nonzero_count}/{len(rows)}")
+    if args.n_attempts > 1:
+        print(
+            f"**Pass^{args.n_attempts}** (all {args.n_attempts} attempts >= {args.pass_threshold}): "
+            f"{pass_pow_k}/{len(rows)} = {pass_pow_k / max(len(rows), 1):.3f}"
+        )
+        print(
+            f"**Pass@{args.n_attempts}** (any attempt >= {args.pass_threshold}): "
+            f"{pass_at_k}/{len(rows)} = {pass_at_k / max(len(rows), 1):.3f}"
+        )
     print(f"**error/missing**: {error_count}/{len(rows)}")
     print(f"**total cost**: ${total_cost:.4f}")
     print(f"**elapsed**: {elapsed_s:.0f}s")
@@ -227,9 +326,13 @@ def main() -> int:
         "agent_import_path": args.agent_import_path,
         "max_steps": args.max_steps,
         "timeout_s": args.timeout_s,
+        "n_attempts": args.n_attempts,
+        "pass_threshold": args.pass_threshold,
         "n_tasks": len(rows),
         "mean_reward": mean_reward,
         "nonzero_count": nonzero_count,
+        "pass_pow_k": pass_pow_k,
+        "pass_at_k": pass_at_k,
         "error_count": error_count,
         "total_cost_usd": total_cost,
         "elapsed_s": elapsed_s,
