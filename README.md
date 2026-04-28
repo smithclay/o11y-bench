@@ -215,6 +215,28 @@ Use either `--agent` or `--agent-import-path`, not both.
 The LangChain agent in this repo is intentionally a simple example of wiring a custom Harbor agent
 entrypoint through the existing benchmark flow.
 
+### predict-rlm Agent
+
+`agents/predict_rlm_o11y_agent.py` runs tasks through a
+[predict-rlm](https://github.com/Trampoline-AI/predict-rlm) runtime: the outer
+LM writes Python in a sandboxed REPL and composes MCP tool calls (Prometheus,
+Loki, Tempo, dashboards) and `await predict(...)` sub-LM calls programmatically.
+Trajectories are interpretable Python turns rather than raw tool-call/observation
+pairs, which avoids the context-rot failure mode that dominates Pass^3 on this
+benchmark.
+
+```bash
+mise run bench:job -- \
+  --model anthropic/claude-opus-4-7 \
+  --agent-import-path agents.predict_rlm_o11y_agent:PredictRLMO11yAgent \
+  --task-name query-cpu-metrics --n-concurrent 1
+```
+
+The outer LM identifier comes from `--model` (or the `O11Y_RLM_OUTER` env var).
+The structured-extraction sub-LM defaults to `anthropic/claude-haiku-4-5` and can
+be overridden with `O11Y_RLM_SUB`. `O11Y_RLM_MAX_STEPS` and `O11Y_RLM_TIMEOUT_S`
+cap REPL turns and wall-clock budget respectively.
+
 ## Running Your Own Models
 
 If your model is reachable through Harbor and LiteLLM, pass it as `provider/model`.
