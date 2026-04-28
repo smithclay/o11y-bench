@@ -144,6 +144,42 @@ def build_tools(session: Any) -> dict[str, Callable[..., Awaitable[Any]]]:
         """
         return await uids.all()  # returns the cached {type: uid} dict
 
+    async def list_metrics(regex: str = ".+", limit: int = 50) -> Any:
+        """Discover Prometheus metric names matching ``regex`` (RE2 syntax).
+
+        ALWAYS call this first when you don't know the exact metric name —
+        guessing common conventions like ``cache_lag_seconds`` typically
+        misses the actual metric (which may be ``service_cache_refresh_lag_*``
+        or similar). Examples:
+        - ``await list_metrics(".*cpu.*")`` for CPU metrics
+        - ``await list_metrics(".*_bucket$")`` for histograms (use with
+          ``histogram_quantile`` for p95/p99 latency)
+        - ``await list_metrics(".*cache.*")`` to find cache-related metrics
+
+        Returns the list of matching metric names (capped by ``limit``).
+        """
+        args = {
+            "datasourceUid": await uids.get("prometheus"),
+            "regex": regex,
+            "limit": limit,
+        }
+        return _decode(await session.call_tool("list_prometheus_metric_names", args))
+
+    async def list_log_labels(start: str | None = None, end: str | None = None) -> Any:
+        """Discover Loki log label names available in the time range.
+
+        Use when you don't know the right selector. ``{job="x"}``,
+        ``{service="y"}``, ``{level="error"}`` — the exact label keys vary by
+        stack. ``start``/``end`` are ISO-8601; defaults to last hour if
+        omitted.
+        """
+        args: dict[str, Any] = {"datasourceUid": await uids.get("loki")}
+        if start:
+            args["startRfc3339"] = start
+        if end:
+            args["endRfc3339"] = end
+        return _decode(await session.call_tool("list_loki_label_names", args))
+
     async def query_metrics(
         expr: str,
         start: str | None = None,
@@ -229,6 +265,8 @@ def build_tools(session: Any) -> dict[str, Callable[..., Awaitable[Any]]]:
 
     return {
         "list_datasources": list_datasources,
+        "list_metrics": list_metrics,
+        "list_log_labels": list_log_labels,
         "query_metrics": query_metrics,
         "query_logs": query_logs,
         "query_traces": query_traces,

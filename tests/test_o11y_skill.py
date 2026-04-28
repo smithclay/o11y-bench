@@ -41,12 +41,55 @@ def test_build_tools_keys_match_expected_helpers():
     tools = build_tools(MockMCPSession())
     assert set(tools) == {
         "list_datasources",
+        "list_metrics",
+        "list_log_labels",
         "query_metrics",
         "query_logs",
         "query_traces",
         "get_dashboard",
         "save_dashboard",
         "search_dashboards",
+    }
+
+
+@pytest.mark.anyio
+async def test_list_metrics_routes_to_prometheus_metric_names():
+    session = MockMCPSession(
+        canned={
+            "list_datasources": _DATASOURCES,
+            "list_prometheus_metric_names": ["http_requests_total", "cache_refresh_lag_seconds"],
+        }
+    )
+    tools = build_tools(session)
+
+    result = await tools["list_metrics"](regex=".*cache.*", limit=10)
+
+    metric_call = next(c for c in session.calls if c[0] == "list_prometheus_metric_names")
+    assert metric_call[1] == {
+        "datasourceUid": "prom-1",
+        "regex": ".*cache.*",
+        "limit": 10,
+    }
+    assert result == ["http_requests_total", "cache_refresh_lag_seconds"]
+
+
+@pytest.mark.anyio
+async def test_list_log_labels_routes_to_loki_label_names():
+    session = MockMCPSession(
+        canned={
+            "list_datasources": _DATASOURCES,
+            "list_loki_label_names": ["job", "service", "level"],
+        }
+    )
+    tools = build_tools(session)
+
+    await tools["list_log_labels"](start="2026-04-25T00:00:00Z", end="2026-04-25T01:00:00Z")
+
+    loki_call = next(c for c in session.calls if c[0] == "list_loki_label_names")
+    assert loki_call[1] == {
+        "datasourceUid": "loki-1",
+        "startRfc3339": "2026-04-25T00:00:00Z",
+        "endRfc3339": "2026-04-25T01:00:00Z",
     }
 
 
@@ -205,5 +248,5 @@ def test_build_o11y_skill_bundles_instructions_and_tools():
     assert skill.name == "o11y"
     # Sanity: instructions came from instructions.md
     assert "PromQL" in skill.instructions and "TraceQL" in skill.instructions
-    # All 7 helpers exposed via the skill's tools dict
-    assert len(skill.tools) == 7
+    # 9 helpers exposed via the skill's tools dict
+    assert len(skill.tools) == 9
